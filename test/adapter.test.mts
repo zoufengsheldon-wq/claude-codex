@@ -432,6 +432,10 @@ test('Codex app config payload model and effort map into Claude runtime context'
       CLAUDE_CODEX_MOCK: '1',
       CLAUDE_CODEX_MODELS: '',
       CLAUDE_CODEX_MODEL_ALIASES: '',
+      // Pin to the built-in mapping — the host shell may set this (e.g.
+      // xhigh→max in ~/.zshenv) and the effort assertions below expect
+      // the unaliased wire values.
+      CLAUDE_CODEX_EFFORT_ALIASES: '',
       NODE_NO_WARNINGS: '1',
     },
   })

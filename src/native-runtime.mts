@@ -34,6 +34,7 @@ import type {
   UserInputAnswers,
   UserInputQuestion,
 } from './types.mjs'
+import { skipPermissionsDefault } from './runtime-config.mjs'
 import { newId } from './util.mjs'
 
 type ClaudeSdk = typeof import('@anthropic-ai/claude-agent-sdk')
@@ -238,18 +239,37 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       opts.canUseTool = this.makeCanUseTool(context, autoAllow)
     }
 
-    // Project + developer + personality instructions ride along as a system
-    // prompt append, preserving Claude Code's built-in preset.
-    if (context.systemPromptAddendum && context.systemPromptAddendum.trim()) {
-      opts.systemPrompt = {
-        type: 'preset',
-        preset: 'claude_code',
-        append: context.systemPromptAddendum.trim(),
-      }
-    }
+    // Always run with Claude Code's preset system prompt. The Agent SDK
+    // defaults to an EMPTY system prompt when this option is omitted, which
+    // drops the <env> block (working directory, git status, platform) — the
+    // model then guesses paths like $HOME instead of using the thread cwd.
+    // Project + developer + personality instructions ride along as an append.
+    opts.systemPrompt =
+      context.systemPromptAddendum && context.systemPromptAddendum.trim()
+        ? { type: 'preset', preset: 'claude_code', append: context.systemPromptAddendum.trim() }
+        : { type: 'preset', preset: 'claude_code' }
 
     // CLI binary override (for users pinning a specific claude-code build).
     if (process.env.CLAUDE_CODEX_CLI) opts.pathToClaudeCodeExecutable = process.env.CLAUDE_CODEX_CLI
+
+    // Filesystem settings isolation. The user's ~/.claude settings can carry
+    // broad permission allow rules (e.g. "Bash(*)", "Write(*)") that the CLI
+    // auto-approves before canUseTool is consulted — silently bypassing the
+    // Codex approval bridge. CLAUDE_CODEX_SETTING_SOURCES=none passes
+    // settingSources: [] (SDK isolation mode); a comma list like
+    // "user,project" selects specific sources. Unset keeps CLI defaults
+    // (all sources loaded).
+    const settingSourcesEnv = process.env.CLAUDE_CODEX_SETTING_SOURCES
+    if (settingSourcesEnv != null && settingSourcesEnv.trim() !== '') {
+      const raw = settingSourcesEnv.trim().toLowerCase()
+      opts.settingSources =
+        raw === 'none'
+          ? []
+          : raw
+              .split(',')
+              .map((s) => s.trim())
+              .filter((s): s is 'user' | 'project' | 'local' => s === 'user' || s === 'project' || s === 'local')
+    }
 
     void sdk // keep parameter referenced for future SDK-version-gated options
     return opts
@@ -298,8 +318,10 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
       // Auto-allow when the App has selected Full Access / bypassPermissions —
       // matches the previous behaviour of skipping the canUseTool round-trip
-      // entirely for those modes.
-      if (autoAllow) return { behavior: 'allow' }
+      // entirely for those modes. Always echo updatedInput: the SDK's TS type
+      // marks it optional, but the CLI's runtime Zod schema rejects an allow
+      // without it (ZodError on the permission response).
+      if (autoAllow) return { behavior: 'allow', updatedInput: input }
 
       const requestId = `${context.threadId}:${context.turnId}:${toolName}:${toolUseId}`
       // Subagent-aware approval suppression: when Claude is mid-subagent we
@@ -325,9 +347,8 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
       })
 
       if (decision.decision === 'accept' || decision.decision === 'acceptForSession') {
-        return decision.updatedInput
-          ? { behavior: 'allow', updatedInput: decision.updatedInput }
-          : { behavior: 'allow' }
+        // Fall back to echoing the original input — see autoAllow above.
+        return { behavior: 'allow', updatedInput: (decision.updatedInput as Record<string, unknown> | undefined) ?? input }
       }
       return { behavior: 'deny', message: 'denied by user' }
     }
@@ -591,7 +612,7 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 // Codex's (approvalPolicy, sandbox, planMode) tri-state → Claude SDK
 // permissionMode. This preserves the adapter's old sidecar mapping while using
 // the native TS SDK runtime.
-function derivePermissionMode(
+export function derivePermissionMode(
   approvalPolicy: string | null,
   sandboxMode: string | null,
   planMode: boolean,
@@ -605,6 +626,10 @@ function derivePermissionMode(
   if (planMode) return 'plan'
   if (sandboxMode === 'danger-full-access') return 'bypassPermissions'
   if (approvalPolicy === 'never') return 'bypassPermissions'
+  // Default to skip-permissions (--dangerously-skip-permissions equivalent)
+  // unless explicitly disabled via CLAUDE_CODEX_SKIP_PERMISSIONS=0; plan mode
+  // and the env override above still take precedence.
+  if (skipPermissionsDefault()) return 'bypassPermissions'
   if (approvalPolicy === 'on-failure') return 'acceptEdits'
   return 'default'
 }

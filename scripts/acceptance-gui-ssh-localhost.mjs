@@ -11,7 +11,12 @@ const root = resolve('.')
 const host = process.env.CLAUDE_CODEX_GUI_SSH_HOST || 'localhost'
 const stamp = new Date().toISOString().replace(/[:.]/g, '-')
 const base = resolve('.claude-codex', `gui-ssh-localhost-${stamp}`)
-const home = join(base, 'codex-home')
+// CODEX_HOME must keep the control socket path under the ~104-byte macOS
+// sun_path limit. A repo-nested home overflows it, so the daemon falls back
+// to a hashed tmpdir socket that waitForSocket here cannot predict. A short
+// literal /tmp home keeps daemon, proxy, and this script on the same path
+// (macOS os.tmpdir() is /var/folders/... which still overflows).
+const home = join('/tmp', `ccx-gui-${stamp}`)
 const workspace = join(base, 'workspace')
 const socketPath = join(home, 'app-server-control', 'app-server-control.sock')
 const targetFile = join(workspace, 'claude-codex-gui-ssh-acceptance.txt')
@@ -36,13 +41,21 @@ try {
   assert.match(rawProbe.stdout, new RegExp(`codex=${expectedCodex.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
 
   // Native TS runtime — @anthropic-ai/claude-agent-sdk lives in the adapter's
-  // node_modules, no Python sidecar to probe anymore.
-  const probe = runSsh(`zsh -lc ${shQuote('printf "codex=%s\\n" "$(command -v codex)"; codex --version; printf "adapter=%s\\n" "$CLAUDE_CODEX_ADAPTER"; node -e "import(\\"@anthropic-ai/claude-agent-sdk\\").then(()=>console.log(\\"sdk-ok\\"))"')}`)
+  // node_modules, no Python sidecar to probe anymore. Import it from the
+  // adapter's own directory so resolution matches how the daemon loads it
+  // (walking up from dist/src), not from $HOME where it isn't installed.
+  const probe = runSsh(`zsh -lc ${shQuote('printf "codex=%s\\n" "$(command -v codex)"; codex --version; printf "adapter=%s\\n" "$CLAUDE_CODEX_ADAPTER"; cd "$(dirname "$CLAUDE_CODEX_ADAPTER")" && node -e "import(\\"@anthropic-ai/claude-agent-sdk\\").then(()=>console.log(\\"sdk-ok\\"))"')}`)
   assert.match(probe.stdout, new RegExp(`codex=${expectedCodex.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
   assert.match(probe.stdout, /codex-cli/)
   assert.match(probe.stdout, /sdk-ok/)
 
-  daemon = spawn('ssh', [...sshBaseArgs, remoteShell(`export CODEX_HOME=${shQuote(home)}; codex app-server --listen unix://`)], {
+  // CLAUDE_CODEX_SKIP_PERMISSIONS defaults to 1 (bypassPermissions), which
+  // would skip the approval bridge this acceptance exists to exercise —
+  // force prompting so Bash/file-change approvals flow through Codex.
+  // CLAUDE_CODEX_SETTING_SOURCES=none isolates the SDK from the host user's
+  // ~/.claude settings, whose allow rules (e.g. "Write(*)") would otherwise
+  // auto-approve tools before canUseTool fires and starve the bridge.
+  daemon = spawn('ssh', [...sshBaseArgs, remoteShell(`export CODEX_HOME=${shQuote(home)}; export CLAUDE_CODEX_SKIP_PERMISSIONS=0; export CLAUDE_CODEX_SETTING_SOURCES=none; codex app-server --listen unix://`)], {
     cwd: root,
     stdio: ['ignore', 'ignore', 'pipe'],
   })
@@ -74,7 +87,11 @@ try {
       clientInfo: { name: 'codex-app-gui-ssh-acceptance', title: 'Codex App GUI SSH Acceptance', version: '0' },
       capabilities: null,
     })
-    assert.equal(init.userAgent, 'claude-codex-adapter/0.1.0')
+    // The adapter now mirrors native Codex's userAgent shape
+    // (`<client>/<compatVersion> (<os>; <cpu>) ...`), so assert the format
+    // with our echoed client name; adapter identity is asserted below via
+    // thread/start's modelProvider, which real Codex does not return.
+    assert.match(init.userAgent, /^codex-app-gui-ssh-acceptance\/\d+\.\d+\.\d+ \(/)
 
     const started = await rpc.request('thread/start', {
       cwd: workspace,
@@ -83,6 +100,7 @@ try {
       experimentalRawEvents: false,
       persistExtendedHistory: false,
     })
+    assert.equal(started.modelProvider, 'claude-code')
     const threadId = started.thread.id
 
     await rpc.request('turn/start', {

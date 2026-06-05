@@ -257,6 +257,7 @@ export function claudeModelOptions(): Array<{ id: string; sdkModel: string | nul
     modelOption('haiku', false, 'Claude Code latest Haiku alias'),
     modelOption('sonnet-1m', false, 'Claude Code Sonnet long-context alias'),
     modelOption('opus-plan', false, 'Claude Code Opus planning alias'),
+    modelOption('claude-opus-4-8', false, 'Pinned Claude Opus model'),
     modelOption('claude-sonnet-4-6', false, 'Pinned Claude Sonnet model'),
     modelOption('claude-sonnet-4-5', false, 'Pinned Claude Sonnet model'),
     modelOption('claude-opus-4-5', false, 'Pinned Claude Opus model'),
@@ -383,15 +384,14 @@ export function resolveCodexBinary(): string | null {
   // PATH walk is mostly for dev — production deployments should set
   // CODEX_REAL explicitly in the shim env (~/.zshenv).
   const paths = (process.env.PATH ?? '').split(':').filter(Boolean)
-  const fsSync = require('node:fs') as typeof import('node:fs')
   for (const dir of paths) {
     const candidate = `${dir}/codex`
     try {
-      const st = fsSync.statSync(candidate)
+      const st = statSync(candidate)
       if (!st.isFile()) continue
       // Skip our shim — a hashbang + 'CLAUDE_CODEX' header is a strong
       // signal it's our codex-shim and would recurse.
-      const head = fsSync.readFileSync(candidate, { encoding: 'utf8' }).slice(0, 200)
+      const head = readFileSync(candidate, { encoding: 'utf8' }).slice(0, 200)
       if (head.includes('CLAUDE_CODEX_ADAPTER') || head.includes('claude-codex')) continue
       return candidate
     } catch {}
