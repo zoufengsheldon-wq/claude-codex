@@ -7,8 +7,8 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { ClaudePTranscriptRuntime } from '../src/claude-p-runtime.mjs'
 import { HttpAgentRuntime, hasAgentapiTrustPrompt, sanitizeAgentapiTerminalContent } from '../src/http-agent-runtime.mjs'
-import { sdkResumeSessionId } from '../src/native-runtime.mjs'
-import { resolveRuntimeConfig } from '../src/runtime-config.mjs'
+import { derivePermissionMode, sdkResumeSessionId } from '../src/native-runtime.mjs'
+import { resolveRuntimeConfig, skipPermissionsDefault } from '../src/runtime-config.mjs'
 
 test('runtime config keeps legacy defaults and accepts explicit backends', () => {
   assert.equal(resolveRuntimeConfig({}).type, 'agent-sdk-sidecar')
@@ -22,6 +22,48 @@ test('runtime config keeps legacy defaults and accepts explicit backends', () =>
   assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_MODE_COMMAND: '/tmp/mode' }).http.modeCommand, '/tmp/mode')
   assert.equal(resolveRuntimeConfig({}).claudeP.stopTimeoutRetries, 1)
   assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_CLAUDE_P_STOP_TIMEOUT_RETRIES: '0' }).claudeP.stopTimeoutRetries, 0)
+})
+
+test('skip-permissions defaults on and honors unified + runtime-specific overrides', () => {
+  assert.equal(skipPermissionsDefault({}), true)
+  assert.equal(skipPermissionsDefault({ CLAUDE_CODEX_SKIP_PERMISSIONS: '0' }), false)
+  assert.equal(skipPermissionsDefault({ CLAUDE_CODEX_SKIP_PERMISSIONS: 'false' }), false)
+  assert.equal(skipPermissionsDefault({ CLAUDE_CODEX_SKIP_PERMISSIONS: '1' }), true)
+  assert.equal(resolveRuntimeConfig({}).claudeP.skipPermissions, true)
+  assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_SKIP_PERMISSIONS: '0' }).claudeP.skipPermissions, false)
+  // claude-p specific flag wins over the unified one in both directions.
+  assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_CLAUDE_P_SKIP_PERMISSIONS: '0' }).claudeP.skipPermissions, false)
+  assert.equal(
+    resolveRuntimeConfig({ CLAUDE_CODEX_SKIP_PERMISSIONS: '0', CLAUDE_CODEX_CLAUDE_P_SKIP_PERMISSIONS: '1' }).claudeP.skipPermissions,
+    true,
+  )
+})
+
+test('native runtime derives bypassPermissions by default but keeps plan/env precedence', () => {
+  const savedSkip = process.env.CLAUDE_CODEX_SKIP_PERMISSIONS
+  const savedMode = process.env.CLAUDE_CODEX_PERMISSION_MODE
+  try {
+    delete process.env.CLAUDE_CODEX_SKIP_PERMISSIONS
+    delete process.env.CLAUDE_CODEX_PERMISSION_MODE
+    assert.equal(derivePermissionMode(null, null, false), 'bypassPermissions')
+    assert.equal(derivePermissionMode('on-failure', null, false), 'bypassPermissions')
+    assert.equal(derivePermissionMode(null, null, true), 'plan')
+
+    process.env.CLAUDE_CODEX_SKIP_PERMISSIONS = '0'
+    assert.equal(derivePermissionMode(null, null, false), 'default')
+    assert.equal(derivePermissionMode('on-failure', null, false), 'acceptEdits')
+    assert.equal(derivePermissionMode('never', null, false), 'bypassPermissions')
+    assert.equal(derivePermissionMode(null, 'danger-full-access', false), 'bypassPermissions')
+
+    process.env.CLAUDE_CODEX_PERMISSION_MODE = 'acceptEdits'
+    delete process.env.CLAUDE_CODEX_SKIP_PERMISSIONS
+    assert.equal(derivePermissionMode(null, null, false), 'acceptEdits')
+  } finally {
+    if (savedSkip == null) delete process.env.CLAUDE_CODEX_SKIP_PERMISSIONS
+    else process.env.CLAUDE_CODEX_SKIP_PERMISSIONS = savedSkip
+    if (savedMode == null) delete process.env.CLAUDE_CODEX_PERMISSION_MODE
+    else process.env.CLAUDE_CODEX_PERMISSION_MODE = savedMode
+  }
 })
 
 test('native SDK runtime ignores bridge session markers when resuming SDK turns', () => {

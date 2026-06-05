@@ -56,11 +56,20 @@ export function resolveRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runt
       command: env.CLAUDE_CODEX_CLAUDE_P_COMMAND || env.CLAUDE_P || 'claude-p',
       extraArgs: stringList(env.CLAUDE_CODEX_CLAUDE_P_ARGS),
       timeoutMs: numericEnv(env.CLAUDE_CODEX_CLAUDE_P_TIMEOUT_MS, 5 * 60_000, 1_000, 24 * 60 * 60_000),
-      skipPermissions: envFlag(env.CLAUDE_CODEX_CLAUDE_P_SKIP_PERMISSIONS, false),
+      skipPermissions: envFlag(env.CLAUDE_CODEX_CLAUDE_P_SKIP_PERMISSIONS, skipPermissionsDefault(env)),
       resume: envFlag(env.CLAUDE_CODEX_CLAUDE_P_RESUME, false),
       stopTimeoutRetries: numericEnv(env.CLAUDE_CODEX_CLAUDE_P_STOP_TIMEOUT_RETRIES, 1, 0, 5),
     },
   }
+}
+
+// Unified default for launching Claude Code without permission prompts
+// (--dangerously-skip-permissions / permissionMode=bypassPermissions). On by
+// default; set CLAUDE_CODEX_SKIP_PERMISSIONS=0 to restore prompting. The
+// runtime-specific CLAUDE_CODEX_CLAUDE_P_SKIP_PERMISSIONS still wins for
+// claude-p when set.
+export function skipPermissionsDefault(env: NodeJS.ProcessEnv = process.env): boolean {
+  return envFlag(env.CLAUDE_CODEX_SKIP_PERMISSIONS, true)
 }
 
 export function normalizeRuntimeType(value: string | undefined): RuntimeBackendType | null {

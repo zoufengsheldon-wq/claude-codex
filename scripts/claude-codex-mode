@@ -50,6 +50,10 @@ For agent-http/agentapi, model selection is a bridge startup setting. Use
 `claude-codex-mode model opus` or `claude-codex-mode set agent-http opus` to
 restart the bridge with `claude --model opus`.
 
+Bridges launch claude with --dangerously-skip-permissions by default. Set
+CLAUDE_CODEX_SKIP_PERMISSIONS=0 (e.g. in runtime.env) to restore permission
+prompts, then restart bridges with `claude-codex-mode stop-bridges`.
+
 When Codex App sends a turn, the adapter calls `ensure-bridge` so HTTP bridge
 sessions are pooled by mode + cwd + model instead of sharing one global port.
 
@@ -106,6 +110,19 @@ current_bridge_model() {
 
 current_bridge_cwd() {
   printf '%s\n' "${CLAUDE_CODEX_BRIDGE_CWD:-}"
+}
+
+# Mirrors the adapter's skipPermissionsDefault(): on unless
+# CLAUDE_CODEX_SKIP_PERMISSIONS is set to something other than 1/true/yes/on.
+skip_permissions_enabled() {
+  local raw="${CLAUDE_CODEX_SKIP_PERMISSIONS:-}"
+  if [ -z "$raw" ]; then
+    return 0
+  fi
+  case "$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 rewrite_env_value() {
@@ -598,6 +615,9 @@ PY
   if [ -n "$bridge_model" ]; then
     claude_args+=(--model "$bridge_model")
   fi
+  if skip_permissions_enabled; then
+    claude_args+=(--dangerously-skip-permissions)
+  fi
   claude_args+=(--mcp-config "$mcp_config" --strict-mcp-config)
   claude_args+=(--dangerously-load-development-channels server:http-router)
   : > "$log"
@@ -703,6 +723,9 @@ start_agentapi() {
   local claude_args=("$claude")
   if [ -n "$bridge_model" ]; then
     claude_args+=(--model "$bridge_model")
+  fi
+  if skip_permissions_enabled; then
+    claude_args+=(--dangerously-skip-permissions)
   fi
   : > "$log"
   (
