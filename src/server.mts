@@ -1058,6 +1058,19 @@ export class CodexClaudeAppServer {
     // report a real durationMs in turn/completed (otherwise the App's status
     // bar shows "—" for every command).
     const itemStartedAtMs = new Map<string, number>()
+    // Claude's task-management tools (TaskCreate / TaskUpdate / TaskList …),
+    // loaded on demand via ToolSearch in current builds, are the modern
+    // replacement for TodoWrite. They are stateful and incremental, so rather
+    // than render one generic mcpToolCall card per call we fold them into a
+    // single native `plan` checklist item that refreshes in place. ToolSearch
+    // itself is a tool-loading mechanism with no user-facing value — its cards
+    // are suppressed too. `suppressedToolUses` marks tool_use ids that must NOT
+    // get a generic item (and whose tool_result is consumed here instead).
+    const taskList: Array<{ id: string; subject: string; status: string }> = []
+    const taskCreateSubjects = new Map<string, string>()
+    const taskUpdatePending = new Map<string, { taskId: string; status: string }>()
+    const suppressedToolUses = new Set<string>()
+    let taskPlanItemId: string | null = null
     // Mutable holder rather than `let collectedMetrics`: TS's control-flow
     // analysis doesn't see writes from inside the onEvent callback, so a bare
     // `let` would still be inferred as `null` outside the closure.
@@ -1102,6 +1115,22 @@ export class CodexClaudeAppServer {
       this.store.appendItem(turn.id, item)
       this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() } })
       return reasoningItemId
+    }
+    // Create-or-refresh the single `plan` item that mirrors Claude's Task* tool
+    // checklist. First call emits item/started; every call pushes the full
+    // current checklist via turn/plan/updated (the protocol's authoritative
+    // full-text blob — append-only item/plan/delta can't toggle a checkbox).
+    const upsertTaskPlan = (): void => {
+      const text = formatTaskChecklist(taskList)
+      if (!taskPlanItemId) {
+        taskPlanItemId = newId()
+        const item: ThreadItem = { type: 'plan', id: taskPlanItemId, text }
+        this.store.appendItem(turn.id, item)
+        this.notify(peer, { method: 'item/started', params: { threadId: thread.id, turnId: turn.id, item, startedAtMs: nowMillis() } })
+      } else {
+        this.store.updateItem(turn.id, taskPlanItemId, (item) => (item.type === 'plan' ? { ...item, text } : item))
+      }
+      this.notify(peer, { method: 'turn/plan/updated', params: { threadId: thread.id, turnId: turn.id, planItemId: taskPlanItemId, text } })
     }
 
     // Allow per-turn override of policy (Codex App may attach updated values
@@ -1439,6 +1468,47 @@ export class CodexClaudeAppServer {
             })
             return
           }
+          if (event.type === 'tool_use' && (isTaskManagementToolName(event.toolName) || event.toolName === 'ToolSearch')) {
+            // Fold Task* into the plan checklist (and drop ToolSearch entirely)
+            // instead of emitting a generic mcpToolCall card. The task id is
+            // server-assigned and only appears in TaskCreate's tool_result, so
+            // we stash the create subject / update intent here and apply it
+            // when the result arrives.
+            suppressedToolUses.add(event.toolUseId)
+            if (event.toolName === 'TaskCreate') {
+              taskCreateSubjects.set(event.toolUseId, String(event.input.subject ?? event.input.description ?? '').trim())
+            } else if (event.toolName === 'TaskUpdate') {
+              const taskId = String(event.input.taskId ?? event.input.task_id ?? '').trim()
+              if (taskId) taskUpdatePending.set(event.toolUseId, { taskId, status: String(event.input.status ?? '').trim() })
+            }
+            return
+          }
+          if (event.type === 'tool_result' && suppressedToolUses.has(event.toolUseId)) {
+            suppressedToolUses.delete(event.toolUseId)
+            if (!event.isError) {
+              const resultText = toolResultText(event.content)
+              if (taskCreateSubjects.has(event.toolUseId)) {
+                const subject = taskCreateSubjects.get(event.toolUseId) ?? ''
+                // tool_result: "Task #<id> created successfully: <subject>"
+                const m = /Task\s+#(\S+)\s+created\b/i.exec(resultText)
+                const id = m ? m[1] : String(taskList.length + 1)
+                if (!taskList.some((t) => t.id === id)) {
+                  taskList.push({ id, subject: subject || `Task ${id}`, status: 'pending' })
+                  upsertTaskPlan()
+                }
+              } else if (taskUpdatePending.has(event.toolUseId)) {
+                const upd = taskUpdatePending.get(event.toolUseId)!
+                const task = taskList.find((t) => t.id === upd.taskId)
+                if (task && upd.status) {
+                  task.status = upd.status
+                  upsertTaskPlan()
+                }
+              }
+            }
+            taskCreateSubjects.delete(event.toolUseId)
+            taskUpdatePending.delete(event.toolUseId)
+            return
+          }
           if (event.type === 'tool_use') {
             // Defense in depth against duplicate tool_use events for the same
             // tool_use_id. Claude SDK has been known to emit a block_start
@@ -1505,7 +1575,13 @@ export class CodexClaudeAppServer {
                 }
               }
               if (item.type === 'webSearch') {
-                return { ...item, action: parseWebSearchAction(item.query, resultText) }
+                // Only WebSearch results carry a structured action to parse out
+                // of the result text. A WebFetch openPage item already has its
+                // final action (the url) — leave it as-is.
+                if (item.action?.type === 'search') {
+                  return { ...item, action: parseWebSearchAction(item.query, resultText) }
+                }
+                return item
               }
               return item
             })
@@ -2467,6 +2543,26 @@ export class CodexClaudeAppServer {
         action: { type: 'search', query: q || null, queries: null },
       }
     }
+    if (event.toolName === 'WebFetch') {
+      // Claude's WebFetch({url, prompt}) is a single-page open. Reuse Codex's
+      // webSearch item with the `openPage` action so the App renders the same
+      // native link badge instead of a generic mcpToolCall card. The
+      // tool_result handler leaves openPage actions untouched (only `search`
+      // actions get re-parsed from result text).
+      const url = String(event.input.url ?? '')
+      return {
+        type: 'webSearch',
+        id,
+        query: url,
+        action: { type: 'openPage', url: url || null },
+      }
+    }
+    if (event.toolName === 'TodoWrite') {
+      // Claude's TodoWrite is the checklist Codex renders natively as a `plan`
+      // item. Map it so each todo update lights up the App's plan/checklist UI
+      // (formatted markdown task list) instead of a generic mcpToolCall card.
+      return { type: 'plan', id, text: formatTodoPlan(event.input) }
+    }
     return {
       type: 'mcpToolCall',
       id,
@@ -3226,6 +3322,69 @@ function normalizeDecision(response: unknown): PermissionDecision['decision'] {
     return 'acceptForSession'
   }
   return 'decline'
+}
+
+// Render a Claude TodoWrite({todos:[{content,status,activeForm}]}) payload as a
+// markdown task list for Codex's `plan` ThreadItem. completed → [x],
+// in_progress → [ ] with a ▸ marker + bold (the App highlights the active
+// step), pending → [ ]. Falls back to a single line if the shape is unexpected
+// so the plan card is never empty.
+function formatTodoPlan(input: Record<string, unknown>): string {
+  const todos = Array.isArray(input.todos) ? input.todos : []
+  const lines = todos
+    .map((raw) => {
+      const todo = asRecord(raw)
+      const content = String(todo.content ?? '').trim()
+      const status = String(todo.status ?? 'pending')
+      if (status === 'completed') return content ? `- [x] ${content}` : ''
+      if (status === 'in_progress') {
+        // Use the present-continuous activeForm for the one running step, the
+        // way Claude's own UI surfaces it; fall back to content if absent.
+        const active = String(todo.activeForm ?? '').trim() || content
+        return active ? `- [ ] ▸ **${active}**` : ''
+      }
+      return content ? `- [ ] ${content}` : ''
+    })
+    .filter(Boolean)
+  return lines.length > 0 ? lines.join('\n') : 'Updating plan…'
+}
+
+// Claude's incremental task-management tools (distinct from the `Task`
+// subagent tool, which isSubagentToolName handles). Current builds expose
+// these as deferred tools loaded via ToolSearch.
+function isTaskManagementToolName(name: string | null | undefined): boolean {
+  switch ((name ?? '').trim()) {
+    case 'TaskCreate':
+    case 'TaskUpdate':
+    case 'TaskList':
+    case 'TaskGet':
+    case 'TaskStop':
+    case 'TaskOutput':
+    case 'TaskRead':
+      return true
+    default:
+      return false
+  }
+}
+
+// Render the accumulated Task* checklist into a markdown task list for the
+// `plan` ThreadItem. completed → [x], in_progress → [ ] with a ▸ marker,
+// cancelled → struck through, everything else → [ ].
+function formatTaskChecklist(tasks: Array<{ id: string; subject: string; status: string }>): string {
+  const lines = tasks.map((t) => {
+    const label = t.subject.trim() || `Task ${t.id}`
+    switch (t.status) {
+      case 'completed':
+        return `- [x] ${label}`
+      case 'in_progress':
+        return `- [ ] ▸ **${label}**`
+      case 'cancelled':
+        return `- [ ] ~~${label}~~`
+      default:
+        return `- [ ] ${label}`
+    }
+  })
+  return lines.length > 0 ? lines.join('\n') : 'Updating plan…'
 }
 
 function fileChangeFromTool(toolName: string, input: Record<string, unknown>): FileUpdateChange[] {

@@ -1359,6 +1359,111 @@ test('Claude WebSearch tool maps to native Codex webSearch ThreadItem with actio
   }
 })
 
+test('Claude WebFetch tool maps to native webSearch openPage ThreadItem (not clobbered on result)', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'web fetch check', text_elements: [] }] } }))
+    await reader.nextResponse(2)
+
+    let started: any = null
+    let completed: any = null
+    for (let i = 0; i < 200; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/started' && message.params.item.type === 'webSearch') started = message.params.item
+      if (message.method === 'item/completed' && started && message.params.item.id === started.id) completed = message.params.item
+      if (message.method === 'turn/completed') break
+    }
+    assert.ok(started, 'WebFetch tool_use should emit a native webSearch ThreadItem')
+    assert.deepEqual(started.action, { type: 'openPage', url: 'https://example.com/page' })
+    assert.ok(completed, 'webSearch (WebFetch) item should complete')
+    // The tool_result handler must NOT re-parse openPage as a search action.
+    assert.equal(completed.action.type, 'openPage', 'openPage action must survive tool_result')
+    assert.equal(completed.action.url, 'https://example.com/page')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('Claude Task* tools fold into a single plan checklist (no generic mcpToolCall/ToolSearch cards)', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'task tools check', text_elements: [] }] } }))
+    await reader.nextResponse(2)
+
+    const planStartIds = new Set<string>()
+    let mcpToolCards = 0
+    let lastPlanText = ''
+    for (let i = 0; i < 300; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/started' && message.params.item.type === 'plan') planStartIds.add(message.params.item.id)
+      if (message.method === 'item/started' && message.params.item.type === 'mcpToolCall') mcpToolCards += 1
+      if (message.method === 'turn/plan/updated') lastPlanText = message.params.text
+      if (message.method === 'turn/completed') break
+    }
+    // Exactly ONE plan item for the whole Task* sequence — updated in place.
+    assert.equal(planStartIds.size, 1, 'all Task* calls should fold into a single plan item')
+    // No generic tool cards for TaskCreate/TaskUpdate/ToolSearch.
+    assert.equal(mcpToolCards, 0, 'Task* and ToolSearch must not emit generic mcpToolCall cards')
+    // Final checklist reflects the accumulated state: #1 done, #2 active, #3 pending.
+    assert.match(lastPlanText, /- \[x\] Read requirements/)
+    assert.match(lastPlanText, /- \[ \] ▸ \*\*Write code\*\*/)
+    assert.match(lastPlanText, /- \[ \] Run it/)
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
+test('Claude TodoWrite tool maps to a native plan ThreadItem with a markdown checklist', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
+  const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CODEX_HOME: home, CLAUDE_CODEX_MOCK: '1', NODE_NO_WARNINGS: '1' },
+  })
+  const reader = new JsonLineReader(proc)
+  try {
+    proc.stdin.write(json({ id: 1, method: 'thread/start', params: { cwd: process.cwd() } }))
+    const start = await reader.nextResponse(1)
+    const threadId = start.result.thread.id
+
+    proc.stdin.write(json({ id: 2, method: 'turn/start', params: { threadId, input: [{ type: 'text', text: 'todo write check', text_elements: [] }] } }))
+    await reader.nextResponse(2)
+
+    let planItem: any = null
+    for (let i = 0; i < 200; i += 1) {
+      const message = await reader.next()
+      if (message.method === 'item/started' && message.params.item.type === 'plan') planItem = message.params.item
+      if (message.method === 'turn/completed') break
+    }
+    assert.ok(planItem, 'TodoWrite tool_use should emit a native plan ThreadItem (not a generic mcpToolCall)')
+    assert.match(planItem.text, /- \[x\] Read the spec/, 'completed todo → checked box')
+    assert.match(planItem.text, /- \[ \] ▸ \*\*Writing the code\*\*/, 'in_progress todo → active marker using activeForm')
+    assert.match(planItem.text, /- \[ \] Run the tests/, 'pending todo → unchecked box')
+  } finally {
+    proc.kill()
+    await rm(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 80 })
+  }
+})
+
 test('modelProvider/capabilities/read advertises webSearch=true unless CLAUDE_CODEX_WEBSEARCH=0', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   const proc = spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {

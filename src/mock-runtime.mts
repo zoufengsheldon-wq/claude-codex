@@ -188,6 +188,61 @@ export class MockRuntime implements ClaudeRuntime {
       return
     }
 
+    if (/web fetch check/i.test(context.prompt)) {
+      const toolUseId = `wf-${Date.now()}`
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'WebFetch',
+        input: { url: 'https://example.com/page', prompt: 'summarize' },
+      })
+      await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'fetched page summary' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'web fetch check' })
+      return
+    }
+
+    if (/task tools check/i.test(context.prompt)) {
+      // Mirror modern Claude: discover Task* via ToolSearch (suppressed),
+      // create three tasks, then flip statuses. The adapter folds all of this
+      // into one plan checklist and emits no generic mcpToolCall cards.
+      const search = `ts-${Date.now()}`
+      await handlers.onEvent({ type: 'tool_use', toolUseId: search, toolName: 'ToolSearch', input: { query: 'select:TaskCreate' } })
+      await handlers.onEvent({ type: 'tool_result', toolUseId: search, content: '[{"type":"tool_reference","tool_name":"TaskCreate"}]' })
+      const subjects = ['Read requirements', 'Write code', 'Run it']
+      for (let i = 0; i < subjects.length; i += 1) {
+        const id = `tc-${Date.now()}-${i}`
+        await handlers.onEvent({ type: 'tool_use', toolUseId: id, toolName: 'TaskCreate', input: { subject: subjects[i], description: subjects[i] } })
+        await handlers.onEvent({ type: 'tool_result', toolUseId: id, content: `Task #${i + 1} created successfully: ${subjects[i]}` })
+      }
+      const u1 = `tu-${Date.now()}-1`
+      await handlers.onEvent({ type: 'tool_use', toolUseId: u1, toolName: 'TaskUpdate', input: { taskId: '1', status: 'completed' } })
+      await handlers.onEvent({ type: 'tool_result', toolUseId: u1, content: 'Updated task #1 status' })
+      const u2 = `tu-${Date.now()}-2`
+      await handlers.onEvent({ type: 'tool_use', toolUseId: u2, toolName: 'TaskUpdate', input: { taskId: '2', status: 'in_progress' } })
+      await handlers.onEvent({ type: 'tool_result', toolUseId: u2, content: 'Updated task #2 status' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'task tools check' })
+      return
+    }
+
+    if (/todo write check/i.test(context.prompt)) {
+      const toolUseId = `todo-${Date.now()}`
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId,
+        toolName: 'TodoWrite',
+        input: {
+          todos: [
+            { content: 'Read the spec', status: 'completed', activeForm: 'Reading the spec' },
+            { content: 'Write the code', status: 'in_progress', activeForm: 'Writing the code' },
+            { content: 'Run the tests', status: 'pending', activeForm: 'Running the tests' },
+          ],
+        },
+      })
+      await handlers.onEvent({ type: 'tool_result', toolUseId, content: 'todos updated' })
+      await handlers.onEvent({ type: 'completed', success: true, result: 'todo write check' })
+      return
+    }
+
     if (/plan mode check/i.test(context.prompt)) {
       // plan mode should never reach the per-tool approval path; mirror that
       // here by emitting a tool_use *without* invoking onPermissionRequest.
