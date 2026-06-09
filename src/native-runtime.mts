@@ -589,8 +589,16 @@ export class NativeClaudeRuntime implements ClaudeRuntime {
 
   private async handleOther(pending: PendingTurn, type: string, message: Record<string, unknown>): Promise<void> {
     if (type === 'rate_limit' || type === 'rate_limit_event') {
-      const msg = String(message.message ?? 'rate limit')
-      await pending.handlers.onEvent({ type: 'notice', level: 'warning', message: msg })
+      // Rate-limit events are informational background signals — Claude Code
+      // auto-retries with backoff, so there's nothing for the user to act on.
+      // Surfacing them as a `notice` prepended "[Claude warning] rate limit"
+      // into the agent message bubble on (nearly) every turn, polluting the
+      // conversation. Suppress by default; CLAUDE_CODEX_SHOW_RATE_LIMIT_NOTICE=1
+      // restores the old inline banner for anyone who wants the visibility.
+      if (process.env.CLAUDE_CODEX_SHOW_RATE_LIMIT_NOTICE === '1') {
+        const msg = String(message.message ?? 'rate limit')
+        await pending.handlers.onEvent({ type: 'notice', level: 'warning', message: msg })
+      }
       return
     }
     if (type === 'hook' || type === 'hook_event' || type === 'system_hook_event') {
